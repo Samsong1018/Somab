@@ -8,7 +8,7 @@ import threading
 import numpy as np
 import pygame
 
-COLOR_FILE = ",/somab_color.txt"
+COLOR_FILE = "/home/amosh/somab_color.txt"
 
 # Face Color
 
@@ -50,11 +50,11 @@ BROW_W        = 100    # half-width of brow
 BROW_THICK    = 8      # brow stroke thickness
 
 # ── File paths ────────────────────────────────────────────────────────────────
-STATE_FILE          = ",/somab_state.txt"
-VISEME_FILE         = ",/somab_viseme.txt"
-INFO_FILE           = ",/somab_info.txt"
-DEVMODE_INPUT_FILE  = ",/somab_devmode_input.txt"
-DEVMODE_RESULT_FILE = ",/somab_devmode_result.txt"
+STATE_FILE          = "/home/amosh/somab_state.txt"
+VISEME_FILE         = "/home/amosh/somab_viseme.txt"
+INFO_FILE           = "/home/amosh/somab_info.txt"
+DEVMODE_INPUT_FILE  = "/home/amosh/somab_devmode_input.txt"
+DEVMODE_RESULT_FILE = "/home/amosh/somab_devmode_result.txt"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # POSE SYSTEM
@@ -478,56 +478,96 @@ def draw_devmode(surface, password_text, show_password, error=False):
 def draw_info_panel(surface, info, panel_alpha):
     if not info or panel_alpha < 0.01:
         return
+
     lines   = [l for l in info.split("\n") if l.strip()]
     panel_w = W // 2
-    max_y   = H - 80
+    padding = 60
+    usable_w = panel_w - padding * 2
+    title_y  = 120
+    max_y    = H - 80
 
     panel_surf = pygame.Surface((panel_w, H), pygame.SRCALPHA)
     panel_surf.fill((0, 0, 0, 0))
     pygame.draw.line(panel_surf, (*TEAL, int(180 * panel_alpha)), (0, 80), (0, H - 80), 2)
 
-    y = 120
-    for i, line in enumerate(lines):
-        if y > max_y:
+    if not lines:
+        surface.blit(panel_surf, (W // 2, 0))
+        return
+
+    # ── Title (line 0) ────────────────────────────────────────────────────────
+    title_font_size = 48
+    font = pygame.font.SysFont("monospace", title_font_size, bold=True)
+    text = font.render(lines[0], True, TEAL)
+    if text.get_width() > usable_w:
+        scale = usable_w / text.get_width()
+        title_font_size = int(title_font_size * scale)
+        font = pygame.font.SysFont("monospace", title_font_size, bold=True)
+        text = font.render(lines[0], True, TEAL)
+    panel_surf.blit(text, (padding, title_y))
+    divider_y = title_y + text.get_height() + 10
+    pygame.draw.line(panel_surf, (*TEAL, int(100 * panel_alpha)),
+                     (padding, divider_y), (panel_w - padding, divider_y), 1)
+    body_start_y = divider_y + 14
+
+    if len(lines) <= 1:
+        surface.blit(panel_surf, (W // 2, 0))
+        return
+
+    # ── Word-wrap all body lines into a flat list ─────────────────────────────
+    # Use a fixed modest font size for wrapping measurement
+    BODY_FONT_SIZE = 28
+    body_font = pygame.font.SysFont("monospace", BODY_FONT_SIZE)
+
+    wrapped = []
+    for line in lines[1:]:
+        words = line.split()
+        if not words:
+            wrapped.append("")
+            continue
+        cur = ""
+        for word in words:
+            test = f"{cur} {word}".strip()
+            if body_font.size(test)[0] <= usable_w:
+                cur = test
+            else:
+                if cur:
+                    wrapped.append(cur)
+                cur = word
+        if cur:
+            wrapped.append(cur)
+
+    if not wrapped:
+        surface.blit(panel_surf, (W // 2, 0))
+        return
+
+    # ── Fit font size so all wrapped lines fill the available height ──────────
+    available_h = max_y - body_start_y
+    # Start from desired size and shrink until everything fits
+    for font_size in range(BODY_FONT_SIZE, 11, -1):
+        f = pygame.font.SysFont("monospace", font_size)
+        line_h = f.get_linesize() + 4
+        if line_h * len(wrapped) <= available_h:
+            body_font = f
             break
-        if i == 0:
-            font = pygame.font.SysFont("monospace", 48, bold=True)
-            text = font.render(line, True, TEAL)
-            if text.get_width() > panel_w - 120:
-                scale = (panel_w - 120) / text.get_width()
-                font  = pygame.font.SysFont("monospace", int(48 * scale), bold=True)
-                text  = font.render(line, True, TEAL)
-            panel_surf.blit(text, (60, y))
-            y += text.get_height() + 16
-            pygame.draw.line(panel_surf, (*TEAL, int(100 * panel_alpha)),
-                             (60, y - 8), (panel_w - 60, y - 8), 1)
-            y += 10
-        else:
-            remaining = len(lines) - i
-            available = max_y - y
-            line_h    = min(44, max(22, available // max(remaining, 1)))
-            font_size = max(18, line_h - 8)
-            font      = pygame.font.SysFont("monospace", font_size)
-            words     = line.split()
-            cur       = ""
-            for word in words:
-                test = f"{cur} {word}".strip()
-                if font.size(test)[0] < panel_w - 120:
-                    cur = test
-                else:
-                    if cur:
-                        if y + line_h > max_y:
-                            panel_surf.blit(font.render("...", True, (150,150,150)), (60, y))
-                            surface.blit(panel_surf, (W // 2, 0))
-                            return
-                        panel_surf.blit(font.render(cur, True, (220,220,220)), (60, y))
-                        y += line_h
-                    cur = word
-            if cur and y + line_h <= max_y:
-                panel_surf.blit(font.render(cur, True, (220,220,220)), (60, y))
+    else:
+        # Can't fit everything — just use minimum size and truncate
+        body_font = pygame.font.SysFont("monospace", 12)
+
+    line_h = body_font.get_linesize() + 4
+
+    # ── Render ────────────────────────────────────────────────────────────────
+    y = body_start_y
+    for i, wline in enumerate(wrapped):
+        if y + line_h > max_y:
+            panel_surf.blit(body_font.render("...", True, (150, 150, 150)), (padding, y))
+            break
+        if wline:
+            panel_surf.blit(body_font.render(wline, True, (220, 220, 220)), (padding, y))
+        y += line_h
 
     surface.blit(panel_surf, (W // 2, 0))
-
+    
+    
 # ══════════════════════════════════════════════════════════════════════════════
 # BOOT ANIMATION
 # ══════════════════════════════════════════════════════════════════════════════
@@ -641,8 +681,8 @@ class SleepingZ:
         if self.spawn_timer > 2.5:
             self.spawn_timer = 0.0
             self.zs.append({
-                "x":     eRx + random.randint(80, 160),
-                "y":     float(eyeY),
+                "x":     eRx + random.randint(300, 460),
+                "y":     float(eyeY +100),
                 "size":  random.randint(60, 110),
                 "alpha": 0.0,
                 "phase": "in",

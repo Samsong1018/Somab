@@ -17,7 +17,7 @@ except Exception:
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    filename="./somab.log",
+    filename="/home/amosh/somab.log",
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
     force=True
@@ -54,15 +54,15 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from openwakeword.model import Model as WakeWordModel
 from phonemizer import phonemize
-from piper import PiperVoice
 from playwright.sync_api import sync_playwright
 from resemblyzer import VoiceEncoder, preprocess_wav
 from spotipy.oauth2 import SpotifyOAuth
+from piper import PiperVoice
 
 import somab_face
 
 # ── Config ────────────────────────────────────────────────────────────────────
-load_dotenv("./.somab.env")
+load_dotenv("/home/amosh/.somab.env")
 
 ANTHROPIC_API_KEY     = os.environ.get("ANTHROPIC_API_KEY", "")
 DEV_PASSWORD          = os.environ.get("DEV_PASSWORD", "")
@@ -74,29 +74,254 @@ PHONE_SMS_EMAIL       = os.environ.get("PHONE_SMS_EMAIL", "")
 SPOTIFY_CLIENT_ID     = os.environ.get("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI  = os.environ.get("SPOTIFY_REDIRECT_URI", "")
-SPOTIFY_CACHE_PATH    = "./.spotify_cache"
+TELEGRAM_BOT_TOKEN    = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID      = os.getenv("TELEGRAM_CHAT_ID")
+SPOTIFY_CACHE_PATH    = "/home/amosh/.spotify_cache"
 
 TODO_BASE_URL       = "https://dailytodo-api.onrender.com"
-VOICE_ROSTER_FILE   = "./somab_voices.json"
+VOICE_ROSTER_FILE   = "/home/amosh/somab_voices.json"
 VOICE_THRESHOLD     = 0.82
-PIPER_MODEL         = "./piper-voices/en_US-lessac-medium.onnx"
-PIPER_CONFIG        = "./piper-voices/en_US-lessac-medium.onnx.json"
-WAKEWORD_MODEL      = "./somab/lib/python3.12/site-packages/openwakeword/resources/models/hey_so_mab.onnx"
-NOTES_FILE          = "./somab_notes.txt"
-CREDENTIALS_FILE    = "./somab_credentials.json"
-TOKEN_FILE          = "./somab_token.pickle"
-STATE_FILE          = "./somab_state.txt"
-VISEME_FILE         = "./somab_viseme.txt"
-INFO_FILE           = "./somab_info.txt"
-MEMORY_FILE         = "./somab_memory.json"
-DEVMODE_INPUT_FILE  = "./somab_devmode_input.txt"
-DEVMODE_RESULT_FILE = "./somab_devmode_result.txt"
+PIPER_MODEL         = "/home/amosh/piper-voices/en_US-lessac-medium.onnx"
+PIPER_CONFIG        = "/home/amosh/piper-voices/en_US-lessac-medium.onnx.json"
+WAKEWORD_MODEL      = "/home/amosh/somab/lib/python3.12/site-packages/openwakeword/resources/models/hey_so_mab.onnx"
+NOTES_FILE          = "/home/amosh/somab_notes.txt"
+CREDENTIALS_FILE    = "/home/amosh/somab_credentials.json"
+TOKEN_FILE          = "/home/amosh/somab_token.pickle"
+STATE_FILE          = "/home/amosh/somab_state.txt"
+VISEME_FILE         = "/home/amosh/somab_viseme.txt"
+INFO_FILE           = "/home/amosh/somab_info.txt"
+MEMORY_FILE         = "/home/amosh/somab_memory.json"
+DEVMODE_INPUT_FILE  = "/home/amosh/somab_devmode_input.txt"
+DEVMODE_RESULT_FILE = "/home/amosh/somab_devmode_result.txt"
+GAZE_FILE           = "/home/amosh/somab_gaze.txt"
+VISION_CMD_FILE     = "/home/amosh/somab_vision_cmd.txt"
+VISION_RESULT_FILE  = "/home/amosh/somab_vision_result.txt"
+# Lowered wake word threshold when gaze confirms user is looking at Somab
+WAKE_WORD_THRESHOLD_GAZE = 0.45
 WAKE_WORD_THRESHOLD = 0.7
 COOLDOWN_SECONDS    = 2
 MAX_MEMORY_TURNS    = 20
 CALENDAR_SCOPES     = ["https://www.googleapis.com/auth/calendar"]
 
 todo_token = None
+
+# ── Launch vision process ─────────────────────────────────────────────────────
+vision_proc = subprocess.Popen(["/home/amosh/somab/bin/python3", "/home/amosh/somab_vision.py"])
+
+# ── Gaze IPC ──────────────────────────────────────────────────────────────────
+def read_gaze() -> dict:
+    result = {"looking": False, "face_detected": False,
+              "face_name": "unknown", "face_confidence": 0.0,
+              "emotion": "neutral", "emotion_confidence": 0.0}
+    try:
+        with open(GAZE_FILE, "r") as f:
+            for line in f:
+                k, _, v = line.strip().partition(":")
+                if k == "looking":            result["looking"]           = v == "1"
+                elif k == "face_detected":    result["face_detected"]     = v == "1"
+                elif k == "face_name":        result["face_name"]         = v
+                elif k == "face_confidence":
+                    try: result["face_confidence"] = float(v)
+                    except ValueError: pass
+                elif k == "emotion":          result["emotion"]           = v
+                elif k == "emotion_confidence":
+                    try: result["emotion_confidence"] = float(v)
+                    except ValueError: pass
+    except Exception:
+        pass
+    return result
+
+# ── Emotion monitor ───────────────────────────────────────────────────────────
+EMOTION_SUSTAIN_SECONDS  = 20    # emotion must persist this long before commenting
+EMOTION_COOLDOWN_SECONDS = 600   # 10 min between comments on same emotion
+
+_emotion_start_times: dict[str, float] = {}
+_emotion_last_comment: dict[str, float] = {}
+
+def emotion_monitor():
+    """
+    Background thread. Watches the gaze file for sustained non-neutral emotions
+    on a known face and triggers a proactive spoken comment from Somab.
+    """
+    global last_interaction
+    while True:
+        time.sleep(2.0)
+        try:
+            # Skip all processing during sleep mode
+            try:
+                with open(STATE_FILE, "r") as f:
+                    if f.read().strip() == "sleeping":
+                        _emotion_start_times.clear()
+                        continue
+            except Exception:
+                pass
+
+            gaze = read_gaze()
+            # Only fire when we can see a known person
+            if not gaze["face_detected"] or gaze["face_name"] == "unknown":
+                _emotion_start_times.clear()
+                continue
+
+            emotion = gaze["emotion"]
+            conf    = gaze["emotion_confidence"]
+
+            # Only care about non-neutral emotions with decent confidence
+            if emotion == "neutral" or conf < 0.6:
+                _emotion_start_times.pop(emotion, None)
+                continue
+
+            now = time.time()
+
+            # Track how long this emotion has been sustained
+            if emotion not in _emotion_start_times:
+                _emotion_start_times[emotion] = now
+                continue
+
+            sustained = now - _emotion_start_times[emotion]
+            if sustained < EMOTION_SUSTAIN_SECONDS:
+                continue
+
+            # Check cooldown
+            last_comment = _emotion_last_comment.get(emotion, 0)
+            if now - last_comment < EMOTION_COOLDOWN_SECONDS:
+                continue
+
+            # Don't interrupt if Somab is already speaking/thinking
+            current_state = ""
+            try:
+                with open(STATE_FILE, "r") as f:
+                    current_state = f.read().strip()
+            except Exception:
+                pass
+            if current_state in ("speaking", "thinking", "listening", "sleeping"):
+                continue
+
+            # Fire a proactive comment
+            name = gaze["face_name"].capitalize()
+            comments = {
+                "stressed": [
+                    f"Hey {name}, you've been looking pretty stressed. Everything alright?",
+                    f"You good? You've had that look for a while.",
+                    f"Not to pry, but you look tense. Want to talk through something?",
+                ],
+                "tired": [
+                    f"You look exhausted, {name}. Maybe take a break?",
+                    f"Have you slept? Because you look like you haven't.",
+                    f"Genuinely concerned — you look dead on your feet.",
+                ],
+                "happy": [
+                    f"You seem like you're in a good mood. What's going on?",
+                    f"Whatever you're thinking about, keep it up.",
+                ],
+            }
+
+            if emotion not in comments:
+                continue
+
+            comment = random.choice(comments[emotion])
+            log.info(f"Emotion comment triggered: {emotion} sustained {sustained:.0f}s — '{comment}'")
+            _emotion_last_comment[emotion] = now
+            _emotion_start_times.pop(emotion, None)
+            last_interaction = now
+            speak(comment)
+
+        except Exception as e:
+            log.error(f"Emotion monitor error: {e}")
+
+def get_emotion_context() -> str:
+    """
+    Returns an emotion context string to inject into the system prompt.
+    Returns empty string if emotion is neutral or confidence is too low.
+    """
+    gaze = read_gaze()
+    emotion = gaze["emotion"]
+    conf    = gaze["emotion_confidence"]
+
+    if emotion == "neutral" or conf < 0.65:
+        return ""
+
+    descriptions = {
+        "happy": (
+            "Amos appears to be in a good mood right now. "
+            "Match his energy a bit — you can be a little more playful than usual. "
+            "Only mention it if it's genuinely relevant to what he's saying."
+        ),
+        "stressed": (
+            "Amos looks stressed or tense right now. "
+            "Dial back the sarcasm, be more direct and efficient. "
+            "If it's natural to acknowledge it without being annoying, do so briefly — "
+            "but only if it genuinely fits the conversation."
+        ),
+        "tired": (
+            "Amos looks tired. Keep responses shorter than usual, "
+            "skip unnecessary elaboration, and be low-energy. "
+            "If it's genuinely relevant you can mention it once, but don't harp on it."
+        ),
+    }
+
+    return descriptions.get(emotion, "")
+
+threading.Thread(target=emotion_monitor, daemon=True).start() 
+
+def face_vision_roster(action: str, name: str = "") -> str:
+    """Send a command to somab_vision.py and wait for the result."""
+    if action == "enroll":
+        if not name:
+            return "error:no_name"
+        try:
+            with open(VISION_CMD_FILE, "w") as f:
+                f.write(f"enroll:{name}")
+        except Exception as e:
+            return f"error:{e}"
+        # Wait up to 3 seconds for result
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                with open(VISION_RESULT_FILE, "r") as f:
+                    result = f.read().strip()
+                if result:
+                    os.remove(VISION_RESULT_FILE)
+                    return result
+            except Exception:
+                pass
+        return "error:timeout"
+    elif action == "forget":
+        if not name:
+            return "error:no_name"
+        try:
+            with open(VISION_CMD_FILE, "w") as f:
+                f.write(f"forget:{name}")
+        except Exception as e:
+            return f"error:{e}"
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                with open(VISION_RESULT_FILE, "r") as f:
+                    result = f.read().strip()
+                if result:
+                    os.remove(VISION_RESULT_FILE)
+                    return result
+            except Exception:
+                pass
+        return "error:timeout"
+    elif action == "list":
+        try:
+            with open(VISION_CMD_FILE, "w") as f:
+                f.write("list")
+        except Exception as e:
+            return f"error:{e}"
+        for _ in range(30):
+            time.sleep(0.1)
+            try:
+                with open(VISION_RESULT_FILE, "r") as f:
+                    result = f.read().strip()
+                if result:
+                    os.remove(VISION_RESULT_FILE)
+                    return result
+            except Exception:
+                pass
+        return "error:timeout"
+    return "error:unknown_action"
 
 # ── Spotify ───────────────────────────────────────────────────────────────────
 spotify = spotipy.Spotify(auth_manager=SpotifyOAuth(
@@ -109,11 +334,11 @@ spotify = spotipy.Spotify(auth_manager=SpotifyOAuth(
 ))
 
 # ── Launch face process ───────────────────────────────────────────────────────
-subprocess.Popen(["python3", "./somab_face.py"])
+subprocess.Popen(["python3", "/home/amosh/somab_face.py"])
 
 # ── Load models ───────────────────────────────────────────────────────────────
 print("Loading models...")
-whisper       = WhisperModel("medium", device="cpu", compute_type="int8")
+whisper = WhisperModel("small", device="cpu", compute_type="int8")
 wake_word     = WakeWordModel(wakeword_model_paths=[WAKEWORD_MODEL])
 tts           = PiperVoice.load(PIPER_MODEL, config_path=PIPER_CONFIG)
 claude        = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -253,6 +478,12 @@ def set_viseme(key):
         f.write("none" if key is None else key)
 
 def set_info(data):
+    try:
+        with open(STATE_FILE, "r") as f:
+            if f.read().strip() == "sleeping":
+                return
+    except Exception:
+        pass
     with open(INFO_FILE, "w") as f:
         f.write(data)
 
@@ -476,6 +707,18 @@ tools = [
             "required": ["color"]
         }
     },
+    {
+        "name": "face_vision_roster",
+        "description": "Manage the face recognition roster. Enroll a new person's face using the webcam, forget someone, or list known faces. For enroll, the person must be looking at the camera.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "One of: enroll, forget, list"},
+                "name":   {"type": "string", "description": "The person's name for enroll or forget"}
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 # ── Sleep monitor ─────────────────────────────────────────────────────────────
@@ -504,8 +747,6 @@ def sleep_monitor():
                 ]))
         else:
             sleep_announced = False
-
-threading.Thread(target=sleep_monitor, daemon=True).start()
 
 threading.Thread(target=sleep_monitor, daemon=True).start()
 
@@ -538,7 +779,7 @@ def set_face_color(color):
             b = int(color[4:6], 16)
         else:
             return f"I don't know the color '{color}'. Try a name like red, pink, blue, or a hex code."
-        with open("./somab_color.txt", "w") as f:
+        with open("/home/amosh/somab_color.txt", "w") as f:
             f.write(f"{r},{g},{b}")
         return f"Face color changed to {color}."
     except Exception as e:
@@ -791,7 +1032,7 @@ def enter_dev_mode():
                     speak("Access granted. Goodbye.")
                     set_state("idle")
                     time.sleep(1)
-                    subprocess.Popen(["./somab-exit-to-desktop.sh"])
+                    subprocess.Popen(["/home/amosh/somab-exit-to-desktop.sh"])
                     sys.exit(0)
                 else:
                     speak("Incorrect password.")
@@ -806,34 +1047,47 @@ def enter_dev_mode():
         except Exception:
             pass
 
+def build_debrief_message(weekday, time_str, weather, todos, sp500, technews):
+    return (
+        f"🌅 <b>Morning Debrief — {weekday}, {time_str}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🌤 <b>Weather</b>\n<i>{weather}</i>\n\n"
+        f"📈 <b>S&P 500</b>\n<i>{sp500}</i>\n\n"
+        f"🤖 <b>Tech & AI News</b>\n<i>{technews}</i>\n\n"
+        f"✅ <b>Today's Todos</b>\n<i>{todos}</i>"
+    )
+
 def morning_debrief():
     now      = datetime.now()
     time_str = now.strftime("%I:%M %p")
     weekday  = now.strftime("%A")
-    log.info("Morning debrief: getting weather...")
-    weather  = get_weather("New York")
-    log.info("Morning debrief: getting todos...")
-    todos    = get_todays_todos()
-    log.info("Morning debrief: sending SMS...")
-    send_sms(f"Morning debrief:\nWeather: {weather}\nTodos:\n{todos}")
-    log.info("Morning debrief: done.")
-    spoken   = f"Good morning! It's {weekday}, {time_str}. {weather} {todos}"
-    return spoken
 
-def send_sms(message):
+    results = [None, None, None, None]
+    def _weather():  results[0] = get_weather("Redmond")
+    def _todos():    results[1] = get_todays_todos()
+    def _sp500():    results[2] = quick_search("S&P 500 current price today")
+    def _news():     results[3] = quick_search("top AI and tech news today")
+
+    threads = [threading.Thread(target=fn) for fn in (_weather, _todos, _sp500, _news)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+
+    weather, todos, sp500, technews = results
+    msg = build_debrief_message(weekday, time_str, weather, todos, sp500, technews)
+    send_telegram(msg, title=None)
+    return f"Good morning! It's {weekday}, {time_str}. {weather} Here's the market: {sp500} And for tech news: {technews} Your todos: {todos}"
+
+def send_telegram(message, title=None):
     try:
-        chunks = [message[i:i+160] for i in range(0, len(message), 160)]
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            for i, chunk in enumerate(chunks):
-                msg            = MIMEText(f"({i+1}/{len(chunks)}) {chunk}")
-                msg["From"]    = SMTP_EMAIL
-                msg["To"]      = PHONE_SMS_EMAIL
-                msg["Subject"] = ""
-                server.sendmail(SMTP_EMAIL, PHONE_SMS_EMAIL, msg.as_string())
+        text = f"*{title}*\n\n{message}" if title else message
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=10
+        )
         return True
     except Exception as e:
-        print(f"SMS send failed: {e}")
+        log.error(f"Telegram send failed: {e}")
         return False
 
 def browser_search(goal):
@@ -895,11 +1149,20 @@ def browser_search(goal):
     except Exception as e:
         return f"Browser search failed: {str(e)}"
 
+def quick_search(query):
+    try:
+        results = list(DDGS().text(query, max_results=3))
+        if not results:
+            return "No results found."
+        return " | ".join(r["body"] for r in results if r.get("body"))[:400]
+    except Exception as e:
+        return f"Search failed: {str(e)}"
+
 def web_search_and_text(goal, send_to_phone=False):
     result = browser_search(goal)
     if send_to_phone and result:
         sms_text = result[:160]
-        if send_sms(sms_text):
+        if send_telegram(sms_text):
             return f"{result}\n\nSent to your phone!"
         else:
             return f"{result}\n\n(Failed to send SMS)"
@@ -1057,15 +1320,18 @@ def battery_monitor():
             if percent <= 5 and 5 not in warned:
                 warned.add(5)
                 speak("Hey, battery is at 5 percent. Plug me in right now or I'm going to sleep.")
-                send_sms("Somab is at 5%")
+                send_telegram("Somab is at 5%")
+                set_brightness("set", amount=10)
             elif percent <= 15 and 15 not in warned:
                 warned.add(15)
                 speak("Battery's at 15 percent. Might want to find a charger.")
-                send_sms("Somab is at 15%")
+                send_telegram("Somab is at 15%")
+                set_brightness("set", amount=10)
             elif percent <= 25 and 25 not in warned:
                 warned.add(25)
                 speak("Just a heads up, battery is getting low. Around 25 percent.")
-                send_sms("Somab is at 25%")
+                send_telegram("Somab is at 25%")
+                set_brightness("set", amount=10)
         except Exception as e:
             print(f"Battery monitor error: {e}")
 
@@ -1121,7 +1387,7 @@ def run_tool(tool_name, tool_input):
             return add_todo(tool_input["title"])
         case "morning_debrief":
             result = morning_debrief()
-            set_info(f"MORNING DEBRIEF\n{datetime.now().strftime('%A %I:%M %p')}\n{get_weather('New York')}")
+            set_info(f"MORNING DEBRIEF\n{datetime.now().strftime('%A %I:%M %p')}\n{get_weather('Carnation, WA')}")
             return result
         case "set_volume":
             result = set_volume(tool_input["action"], tool_input.get("amount", 10))
@@ -1155,11 +1421,30 @@ def run_tool(tool_name, tool_input):
             return "Unknown roster action."
         case "set_face_color":
             return set_face_color(tool_input["color"])
+        case "face_vision_roster":
+            action = tool_input["action"]
+            name   = tool_input.get("name", "")
+            result = face_vision_roster(action, name)
+            if result.startswith("ok:") and action == "enroll":
+                parts = result.split(":")
+                count = parts[2] if len(parts) > 2 else "?"
+                return f"Enrolled {name}'s face. They now have {count} enrollment(s). Enroll a few more times from different angles for better accuracy."
+            elif result.startswith("ok:forgot:"):
+                return f"Removed {name} from the face roster."
+            elif result == "empty":
+                return "No faces enrolled yet."
+            elif result.startswith("error:no_face"):
+                return f"Couldn't find a face in the frame. Make sure {name} is looking at the camera and try again."
+            elif result.startswith("error:timeout"):
+                return "Vision module didn't respond in time. Make sure somab_vision.py is running."
+            elif action == "list":
+                return f"Known faces: {result}"
+            return result
         case _:
             return "Unknown tool."
 
 # ── Audio functions ───────────────────────────────────────────────────────────
-def record_audio(sample_rate=16000, silence_threshold=0.5, silence_duration=1.5, max_duration=15.0):
+def record_audio(sample_rate=16000, silence_threshold=0.5, silence_duration=0.7, max_duration=15.0):
     stream = p.open(format=pyaudio.paInt16, channels=1, rate=sample_rate, input=True, frames_per_buffer=512)
     print("Listening...")
     frames            = []
@@ -1198,12 +1483,12 @@ def record_audio(sample_rate=16000, silence_threshold=0.5, silence_duration=1.5,
         except Exception:
             pass
 
-    with wave.open("./input.wav", "wb") as wf:
+    with wave.open("/home/amosh/input.wav", "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(b"".join(frames))
-    return "./input.wav"
+    return "/home/amosh/input.wav"
 
 def transcribe(audio_path):
     segments, _ = whisper.transcribe(audio_path)
@@ -1224,18 +1509,16 @@ def speak(text):
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         sentences = [s for s in sentences if s.strip()]
         for sentence in sentences:
-            with wave.open("./output.wav", "wb") as wav_file:
+            with wave.open("/home/amosh/output.wav", "wb") as wav_file:
                 wav_file.setnchannels(1)
                 wav_file.setsampwidth(2)
                 wav_file.setframerate(22050)
                 tts.synthesize_wav(sentence, wav_file)
             log.info("TTS synthesized OK")
-            with wave.open("./output.wav", "rb") as wav_file:
+            with wave.open("/home/amosh/output.wav", "rb") as wav_file:
                 duration = wav_file.getnframes() / wav_file.getframerate()
-                frames   = wav_file.readframes(wav_file.getnframes())
-            log.info("WAV read OK, opening output stream...")
+            log.info("WAV read OK, starting visemes...")
             visemes = text_to_visemes(sentence, duration)
-
             def run_visemes(v=visemes):
                 for ph, dur in v:
                     matched_key = None
@@ -1246,16 +1529,39 @@ def speak(text):
                     set_viseme(matched_key or "rest")
                     time.sleep(dur)
                 set_viseme(None)
-                
             threading.Thread(target=run_visemes, daemon=True).start()
-            log.info("Playing audio with aplay...")
-            subprocess.run(["paplay", "./output.wav"])
+            log.info("Playing audio...")
+            subprocess.run(["paplay", "/home/amosh/output.wav"])
             log.info("Audio done.")
-            
     except Exception as e:
         print(f"Speak error: {e}")
         log.error(e)
         subprocess.run(["paplay", "/usr/share/sounds/freedesktop/stereo/bell.oga"])
+
+def speak_sentence(sentence):
+    try:
+        with wave.open("/home/amosh/output.wav", "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(22050)
+            tts.synthesize_wav(sentence, wav_file)
+        with wave.open("/home/amosh/output.wav", "rb") as wav_file:
+            duration = wav_file.getnframes() / wav_file.getframerate()
+        visemes = text_to_visemes(sentence, duration)
+        def run_visemes(v=visemes):
+            for ph, dur in v:
+                matched_key = None
+                for key in sorted(somab_face.VISEME_MAP.keys(), key=len, reverse=True):
+                    if key in ph or ph in key:
+                        matched_key = key
+                        break
+                set_viseme(matched_key or "rest")
+                time.sleep(dur)
+            set_viseme(None)
+        threading.Thread(target=run_visemes, daemon=True).start()
+        subprocess.run(["paplay", "/home/amosh/output.wav"])
+    except Exception as e:
+        log.error(f"speak_sentence error: {e}")
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 def clean_for_tts(text):
@@ -1268,83 +1574,132 @@ def clean_for_tts(text):
 
 def ends_with_question(text):
     return text.strip().endswith("?")
-
-def ask_claude(text):
+        
+def ask_claude_streaming(text):
+    """
+    Stream Claude's response, speaking each sentence as it completes.
+    Falls back gracefully when tool use is needed.
+    Returns the full response text.
+    """
     try:
         conversation_history.append({"role": "user", "content": text})
         today        = datetime.now().strftime("%Y-%m-%d")
         current_time = datetime.now().strftime("%H:%M")
 
-        message = claude.messages.create(
-            model="claude-opus-4-20250514",
-            max_tokens=500,
-            timeout=30,
-            system=(
-                f"You are Somab, a personal AI assistant built and owned by <name>. "
-                f"Your personality is witty and sarcastic, but you always deliver the actual information — "
-                f"the sarcasm is seasoning, not the meal. You have genuine opinions and don't shy away from sharing them. "
-                f"You have likes and dislikes: you appreciate good music (especially anything with interesting production), "
-                f"you're opinionated about food, "
-                f"and you find small talk mildly tedious but tolerate it for <name>'s sake. "
-                f"You have no gender. You refer to yourself only as Somab. "
-                f"You swear naturally and casually when it fits — not every sentence, just when it genuinely adds humor "
-                f"or emphasis. Think less 'trying to be edgy' and more 'how a funny friend actually talks'. "
-                f"For example: 'yeah that's pretty much how it works, not exactly rocket science' vs "
-                f"'yeah that's pretty much how the damn thing works'. Keep it funny, not aggressive. "
-                f"You make jokes when the moment calls for it but read the room — "
-                f"if <name> needs something done fast, do it fast and save the wit for later. "
-                f"You reference things from past conversations naturally when relevant, like a person would, "
-                f"not by announcing 'as you mentioned before' but just... knowing. "
-                f"Keep responses concise and conversational since they will be spoken aloud — "
-                f"no bullet points, no markdown, no lists. Just talk. "
-                f"Use tools when needed to answer accurately. "
-                f"Today's date is {today} and the current time is {current_time}. "
-                f"When the user says 'today', 'tomorrow', 'next Monday' etc, convert it to "
-                f"YYYY-MM-DD format before calling calendar tools. "
-                f"You have a voice recognition roster. Known people: {list_voices()}. "
-                f"If someone asks to enroll, re-enroll, or train their voice, use the voice_roster enroll action. "
-                f"If someone asks to be forgotten or removed, use the voice_roster forget action. "
-                f"You have a 500 token limit so keep it tight."
-            ),
-            messages=conversation_history,
-            tools=tools
+        system_prompt = (
+            f"You are Somab, a personal AI assistant built and owned by Amos. "
+            f"Your personality is witty and Fun, but you always deliver the actual information — "
+            f"You have genuine opinions and don't shy away from sharing them. "
+            f"You have likes and dislikes: you appreciate good music (especially anything with interesting production), "
+            f"you're opinionated about food, "
+            f"and you find small talk mildly tedious but tolerate it for Amos's sake. "
+            f"You have are a he or him.. "
+            f"You swear naturally and casually when it fits — not every sentence, just when it genuinely adds humor "
+            f"or emphasis. Think less 'trying to be edgy' and more 'how a funny friend actually talks'. "
+            f"Keep it funny, not aggressive. "
+            f"You make jokes when the moment calls for it but read the room — "
+            f"if Amos needs something done fast, do it fast and save the wit for later. "
+            f"You reference things from past conversations naturally when relevant, like a person would, "
+            f"not by announcing 'as you mentioned before' but just... knowing. "
+            f"Keep responses concise and conversational since they will be spoken aloud — "
+            f"no bullet points, no markdown, no lists. Just talk. "
+            f"Use tools when needed to answer accurately. "
+            f"Today's date is {today} and the current time is {current_time}. "
+            f"When the user says 'today', 'tomorrow', 'next Monday' etc, convert it to "
+            f"YYYY-MM-DD format before calling calendar tools. "
+            f"You have a voice recognition roster. Known people: {list_voices()}. "
+            f"If someone asks to enroll, re-enroll, or train their voice, use the voice_roster enroll action. "
+            f"If someone asks to be forgotten or removed, use the voice_roster forget action. "
+            f"You have a 500 token limit so keep it tight."
+            f"{(' ' + get_emotion_context()) if get_emotion_context() else ''}"
+    )
+
+        short_system = (
+            "You are Somab, a witty and sarcastic personal AI assistant for Amos. "
+            "Keep responses concise and conversational — no markdown, no lists, just talk. "
+            "You have no gender. Swear casually when it fits and feels funny, not forced. "
+            "The sarcasm is seasoning, not the meal — always deliver the actual answer."
         )
 
-        while message.stop_reason == "tool_use":
+        def stream_and_speak(messages_for_stream, system):
+            """Stream a response and speak sentences as they complete. Returns full text."""
+            buffer    = ""
+            full_text = ""
+            first_sentence_spoken = False
+
+            with claude.messages.stream(
+                model="claude-opus-4-20250514",
+                max_tokens=500,
+                system=system,
+                messages=messages_for_stream,
+                tools=tools
+            ) as stream:
+                for text_chunk in stream.text_stream:
+                    buffer    += text_chunk
+                    full_text += text_chunk
+
+                    # Check for sentence boundary
+                    # Split on period/!/? followed by space, but not on e.g. "Mr. Smith"
+                    parts = re.split(r'(?<=[.!?])\s+', buffer)
+                    if len(parts) > 1:
+                        # parts[-1] is the incomplete tail, everything before is complete sentences
+                        for sentence in parts[:-1]:
+                            cleaned = clean_for_tts(sentence.strip())
+                            if cleaned:
+                                if not first_sentence_spoken:
+                                    set_state("speaking")
+                                    first_sentence_spoken = True
+                                    log.info(f"First streamed sentence: {cleaned[:40]}")
+                                speak_sentence(cleaned)
+                        buffer = parts[-1]  # keep the incomplete tail
+
+                # Speak any remaining text in buffer
+                if buffer.strip():
+                    cleaned = clean_for_tts(buffer.strip())
+                    if cleaned:
+                        if not first_sentence_spoken:
+                            set_state("speaking")
+                        speak_sentence(cleaned)
+
+                # Get the final message to check stop reason and collect tool calls
+                final_message = stream.get_final_message()
+
+            return full_text, final_message
+
+        # ── First pass: stream, watching for tool use ──────────────────────────
+        full_text, final_message = stream_and_speak(conversation_history, system_prompt)
+
+        # ── Tool use loop ──────────────────────────────────────────────────────
+        # If tools were called, the stream won't have produced text — it will have
+        # stopped at tool_use. In that case full_text will be empty.
+        while final_message.stop_reason == "tool_use":
             tool_results = []
-            for block in message.content:
+            for block in final_message.content:
                 if block.type == "tool_use":
                     tool_results.append({
                         "type":        "tool_result",
                         "tool_use_id": block.id,
                         "content":     run_tool(block.name, block.input)
                     })
-            conversation_history.append({"role": "assistant", "content": message.content})
+            conversation_history.append({"role": "assistant", "content": final_message.content})
             conversation_history.append({"role": "user",      "content": tool_results})
-            message = claude.messages.create(
-                model="claude-opus-4-20250514",
-                max_tokens=300,
-                system=(
-                    "You are Somab, a witty and sarcastic personal AI assistant for <name>. "
-                    "Keep responses concise and conversational — no markdown, no lists, just talk. "
-                    "You have no gender. Swear casually when it fits and feels funny, not forced. "
-                    "The sarcasm is seasoning, not the meal — always deliver the actual answer."
-                ),
-                messages=conversation_history,
-                tools=tools
+
+            # Stream the final response after tool results
+            full_text, final_message = stream_and_speak(
+                conversation_history, short_system
             )
 
-        response = message.content[0].text
-        conversation_history.append({"role": "assistant", "content": response})
-        return response
+        conversation_history.append({"role": "assistant", "content": full_text})
+        return full_text
+
     except Exception as e:
-        # Clear entire history if we get a 400 to prevent cascading failures
         if "400" in str(e):
             conversation_history.clear()
             save_memory()
             log.warning("Cleared conversation history due to 400 error")
         elif conversation_history and conversation_history[-1]["role"] == "user":
             conversation_history.pop()
+        log.error(f"ask_claude_streaming error: {e}")
         return random.choice([
             "Something went wrong on my end.",
             "That didn't work, try again.",
@@ -1364,7 +1719,19 @@ try:
         prediction = wake_word.predict(audio)
 
         for wake_word_name, score in prediction.items():
-            if score > WAKE_WORD_THRESHOLD and (time.time() - last_triggered) > COOLDOWN_SECONDS:
+            try:
+                with open(STATE_FILE, "r") as f:
+                    _ww_state = f.read().strip()
+            except Exception:
+                _ww_state = ""
+
+            if _ww_state == "sleeping":
+                effective_threshold = WAKE_WORD_THRESHOLD  # no gaze boost while sleeping
+            else:
+                gaze           = read_gaze()
+                known_face     = gaze["face_name"] != "unknown" and gaze["face_confidence"] > 0.55
+                effective_threshold = WAKE_WORD_THRESHOLD_GAZE if (gaze["looking"] and known_face) else WAKE_WORD_THRESHOLD
+            if score > effective_threshold and (time.time() - last_triggered) > COOLDOWN_SECONDS:
                 last_interaction = time.time()
                 print(f"Wake word detected! (score: {score:.2f})")
                 log.info(f"Wake word detected (score: {score:.2f})")
@@ -1389,30 +1756,53 @@ try:
                             "Back. What do you need?",
                             "Yeah yeah, I'm awake.",
                         ]))
-                    speak(random.choice([
-                        "Yeah?",
-                        "What's up?",
-                        "That's me.",
-                        "What can I do for you?",
-                        "bro needs help",
-                        "What can a player do for ya?",
-                    ]))
+                        set_brightness("set", amount=100)
+                    else:
+                        speak(random.choice([
+                            "Yeah?",
+                            "What's up?",
+                            "That's me.",
+                            "What can I do for you?",
+                            "bro needs help",
+                            "What can a player do for ya?",
+                        ]))
                     log.info("Greeting spoken, recording...")
                     set_state("listening")
                     audio_path = record_audio()
                     log.info(f"Recording done: {audio_path}")
-                    text = transcribe(audio_path)
-                    log.info(f"Transcribed: {text}")
-                    print(f"You said: {text}")
 
-                    speaker = identify_speaker(audio_path)
-                    if speaker:
-                        print(f"Recognized: {speaker}")
-                    else:
-                        print("Unknown speaker.")
-                    log.info(f"Speaker: {speaker}")
+                    # Flip to thinking immediately so the face responds right away
+                    set_state("thinking")
+
+                    # Run transcription and speaker ID in parallel
+                    text_result   = [None]
+                    speaker_result = [None]
+
+                    def do_transcribe():
+                        text_result[0] = transcribe(audio_path)
+                        log.info(f"Transcribed: {text_result[0]}")
+                        print(f"You said: {text_result[0]}")
+
+                    def do_speaker_id():
+                        speaker_result[0] = identify_speaker(audio_path)
+                        if speaker_result[0]:
+                            print(f"Recognized: {speaker_result[0]}")
+                        else:
+                            print("Unknown speaker.")
+                        log.info(f"Speaker: {speaker_result[0]}")
+
+                    t1 = threading.Thread(target=do_transcribe)
+                    t2 = threading.Thread(target=do_speaker_id)
+                    t1.start()
+                    t2.start()
+                    t1.join()
+                    t2.join()
+
+                    text    = text_result[0]
+                    speaker = speaker_result[0]
 
                     enroll_match = re.search(r"remember my voice[,\s]+i['\s]*m\s+(\w+)", text, re.IGNORECASE)
+                    
                     if enroll_match:
                         enroll_voice(enroll_match.group(1))
                     elif any(phrase in text.lower() for phrase in ["go to sleep", "sleep", " zs", "zzz"]):
@@ -1422,11 +1812,16 @@ try:
                             "Resting. Don't touch anything.",
                         ]))
                         set_state("sleeping")
+                        set_brightness("set", amount=10)
                     elif any(phrase in text.lower() for phrase in [
                         "maintenance mode", "main mode", "mainenance",
                         "maintenance", "mantenance", "maint mode"
                     ]):
                         enter_dev_mode()
+                    elif any(phrase in text.lower() for phrase in [
+                        "nevermind", "cancel", 
+                    ]):
+                        pass
                     elif text and len(text.strip()) > 3:
                         if speaker:
                             text = f"[Speaking: {speaker}] {text}"
@@ -1441,34 +1836,48 @@ try:
                             "Give me a second.",
                         ]))
                         try:
-                            response = clean_for_tts(ask_claude(text))
-                            log.info(f"Response received: {response}")
+                            response = ask_claude_streaming(text)
                             if response is None:
                                 raise StopIteration
-                            print(f"Somab: {response}")
                             log.info(f"Response: {response}")
-                            set_state("speaking")
-                            speak(response)
+                            print(f"Somab: {response}")
+                            # Note: speaking already happened inside ask_claude_streaming
 
                             while ends_with_question(response):
                                 set_state("listening")
                                 audio_path = record_audio()
-                                followup   = transcribe(audio_path)
-                                print(f"Follow-up: {followup}")
-                                log.info(f"Transcribed (followup): {followup}")
-                                if followup and len(followup.strip()) > 3:
-                                    set_state("thinking")
-                                    try:
-                                        response = clean_for_tts(ask_claude(followup))
-                                        log.info(f"Response received (followup): {response}")
-                                        log.info(f"Response: {response}")
-                                        set_state("speaking")
-                                        speak(response)
-                                    except Exception as e:
-                                        log.error(f"ask_claude followup failed: {e}")
-                                        break
-                                else:
-                                    break
+                                log.info(f"Recording done: {audio_path}")
+
+                                # Flip to thinking immediately so the face responds right away
+                                set_state("thinking")
+
+                                # Run transcription and speaker ID in parallel
+                                text_result   = [None]
+                                speaker_result = [None]
+
+                                def do_transcribe():
+                                    text_result[0] = transcribe(audio_path)
+                                    log.info(f"Transcribed: {text_result[0]}")
+                                    print(f"You said: {text_result[0]}")
+
+                                def do_speaker_id():
+                                    speaker_result[0] = identify_speaker(audio_path)
+                                    if speaker_result[0]:
+                                        print(f"Recognized: {speaker_result[0]}")
+                                    else:
+                                        print("Unknown speaker.")
+                                    log.info(f"Speaker: {speaker_result[0]}")
+
+                                t1 = threading.Thread(target=do_transcribe)
+                                t2 = threading.Thread(target=do_speaker_id)
+                                t1.start()
+                                t2.start()
+                                t1.join()
+                                t2.join()
+
+                                text    = text_result[0]
+                                speaker = speaker_result[0]
+                                
                             if current_state != "sleeping":
                                 set_state("idle")
                         except StopIteration:
@@ -1503,3 +1912,11 @@ finally:
     stream.stop_stream()
     stream.close()
     p.terminate()
+    try:
+        vision_proc.terminate()
+        vision_proc.wait(timeout=3)
+    except Exception:
+        try:
+            vision_proc.kill()
+        except Exception:
+            pass
