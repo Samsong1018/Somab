@@ -37,6 +37,7 @@ import time
 import wave
 
 import anthropic
+import chromadb
 import numpy as np
 import pyaudio
 import requests
@@ -104,6 +105,8 @@ MAX_MEMORY_TURNS    = 20
 CALENDAR_SCOPES     = ["https://www.googleapis.com/auth/calendar"]
 
 todo_token = None
+
+_speaking_lock = threading.Lock()
 
 # ── Launch vision process ─────────────────────────────────────────────────────
 vision_proc = subprocess.Popen(["/home/amosh/somab/bin/python3", "/home/amosh/somab_vision.py"])
@@ -323,6 +326,320 @@ def face_vision_roster(action: str, name: str = "") -> str:
         return "error:timeout"
     return "error:unknown_action"
 
+# ── Ambient context buffer ─────────────────────────────────────────────────────
+AMBIENT_CHUNK_SECONDS  = 10
+AMBIENT_MAX_CHARS      = 800
+AMBIENT_VAD_THRESHOLD  = 0.4
+AMBIENT_TTS_BLACKOUT   = 2.5   # seconds to stay deaf after Somab finishes speaking
+
+_ambient_buffer: list[str] = []
+_ambient_lock              = threading.Lock()
+_tts_ended_at: float       = 0.0   # timestamp of last TTS completion
+
+def mark_tts_ended():
+    """Call this immediately after paplay returns, before set_state('idle')."""
+    global _tts_ended_at
+    _tts_ended_at = time.time()
+
+def get_ambient_context() -> str:
+    with _ambient_lock:
+        text = " ".join(_ambient_buffer)
+        return text[-AMBIENT_MAX_CHARS:] if len(text) > AMBIENT_MAX_CHARS else text
+
+def ambient_listener():
+    SAMPLE_RATE      = 16000
+    CHUNK_SIZE       = 512
+    chunks_per_seg   = int(AMBIENT_CHUNK_SECONDS * SAMPLE_RATE / CHUNK_SIZE)
+    tmp_path         = "/home/amosh/ambient_chunk.wav"
+
+    p_amb = pyaudio.PyAudio()
+    stream_amb = p_amb.open(
+        format=pyaudio.paFloat32, channels=1,
+        rate=SAMPLE_RATE, input=True,
+        frames_per_buffer=CHUNK_SIZE
+    )
+
+    while True:
+        try:
+            # Pause while Somab is actively doing anything
+            try:
+                with open(STATE_FILE, "r") as f:
+                    state = f.read().strip()
+            except Exception:
+                state = "idle"
+
+            if state in ("listening", "speaking", "thinking", "sleeping"):
+                time.sleep(0.3)
+                continue
+
+            # Also pause during TTS blackout window
+            if time.time() - _tts_ended_at < AMBIENT_TTS_BLACKOUT:
+                time.sleep(0.1)
+                continue
+
+            # Collect one chunk
+            frames     = []
+            has_speech = False
+            for _ in range(chunks_per_seg):
+                # Re-check state mid-chunk so we bail fast if wake word fires
+                try:
+                    with open(STATE_FILE, "r") as f:
+                        if f.read().strip() != "idle":
+                            frames = []
+                            break
+                except Exception:
+                    pass
+                try:
+                    data = stream_amb.read(CHUNK_SIZE, exception_on_overflow=False)
+                except Exception:
+                    break
+                frames.append(data)
+                audio_np    = np.frombuffer(data, dtype=np.float32)
+                audio_chunk = torch.tensor(audio_np.copy())
+                if vad_model(audio_chunk, SAMPLE_RATE).item() > AMBIENT_VAD_THRESHOLD:
+                    has_speech = True
+
+            if not frames or not has_speech:
+                continue
+
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)   # write int16
+                wf.setframerate(SAMPLE_RATE)
+                # float32 → int16 conversion
+                audio_all = np.concatenate([np.frombuffer(f, dtype=np.float32) for f in frames])
+                wf.writeframes((audio_all * 32767).astype(np.int16).tobytes())
+
+            segments, _ = whisper.transcribe(tmp_path, language="en")
+            text = " ".join(s.text for s in segments).strip()
+
+            if text:
+                with _ambient_lock:
+                    _ambient_buffer.append(text)
+                    # Trim to keep buffer from growing unbounded
+                    while len(" ".join(_ambient_buffer)) > AMBIENT_MAX_CHARS * 2:
+                        _ambient_buffer.pop(0)
+                log.debug(f"Ambient: {text[:80]}")
+
+        except Exception as e:
+            log.error(f"Ambient listener error: {e}")
+            time.sleep(1.0)
+
+threading.Thread(target=ambient_listener, daemon=True).start()
+
+# ── Engagement FSM ─────────────────────────────────────────────────────────────
+# States: "passive" | "gaze_watch" | "engaged"
+_engagement_state      = "passive"
+_engagement_lock       = threading.Lock()
+_last_spoke_to_somab   = 0.0   # timestamp of last time we handled an utterance
+ENGAGED_GAZE_TIMEOUT   = 8.0   # seconds without gaze before disengaging
+
+# Patterns that strongly suggest the utterance is addressed to Somab
+_DIRECT_PATTERNS = re.compile(
+    r'\b(you|somab|hey|what|who|when|where|why|how|can you|do you|will you|could you|'
+    r'tell me|show me|remind|set|play|stop|pause|search|look up|check|calculate|'
+    r'what\'s|what is|who is|how do|how does)\b',
+    re.IGNORECASE
+)
+
+def _is_addressed_to_somab(text: str, ambient_ctx: str) -> bool:
+    """
+    Heuristic + optional mini Claude call to decide if an utterance is
+    directed at Somab. Returns True if Somab should respond.
+    """
+    if not text or len(text.strip()) < 3:
+        return False
+
+    # Fast path: contains "somab" → always yes
+    if "somab" in text.lower():
+        return True
+
+    # Fast path: question or command pattern → probably yes
+    if text.strip().endswith("?") or _DIRECT_PATTERNS.search(text):
+        return True
+
+    # Ambiguous — use a tiny Claude call with the ambient context as tiebreaker
+    # Only do this if we have ambient context to reason from
+    if not ambient_ctx:
+        return False
+
+    try:
+        result = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=10,
+            system=(
+                "You decide whether an utterance is addressed to an AI assistant named Somab. "
+                "Reply with exactly one word: YES or NO. Nothing else."
+            ),
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Recent ambient conversation: {ambient_ctx[-300:]}\n\n"
+                    f"New utterance (said while looking at Somab): \"{text}\"\n\n"
+                    f"Is this addressed to Somab? YES or NO."
+                )
+            }]
+        )
+        answer = result.content[0].text.strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        # If the call fails, default to responding — better to engage than ignore
+        return True
+
+def gaze_engagement_loop():
+    """
+    Background thread. Watches gaze. When the user looks at Somab,
+    silently records what they say next and decides whether to respond.
+    Manages the engaged/passive state transitions.
+    """
+    global _engagement_state, _last_spoke_to_somab
+
+    while True:
+        time.sleep(0.3)
+        try:
+            # Only run in idle/passive — don't fight the wake word interaction
+            try:
+                with open(STATE_FILE, "r") as f:
+                    system_state = f.read().strip()
+            except Exception:
+                system_state = "idle"
+
+            if system_state in ("listening", "speaking", "thinking", "sleeping"):
+                with _engagement_lock:
+                    # If Somab got activated via wake word, reset engagement cleanly
+                    if _engagement_state == "gaze_watch":
+                        _engagement_state = "passive"
+                continue
+
+            gaze       = read_gaze()
+            looking    = gaze["looking"]
+            known_face = gaze["face_name"] != "unknown" and gaze["face_confidence"] > 0.55
+
+            with _engagement_lock:
+                state = _engagement_state
+
+            if state == "passive":
+                if looking and known_face:
+                    with _engagement_lock:
+                        _engagement_state = "gaze_watch"
+                    log.debug("Engagement: passive → gaze_watch")
+
+            elif state == "gaze_watch":
+                if not looking:
+                    # Looked away immediately — not interested
+                    with _engagement_lock:
+                        _engagement_state = "passive"
+                    log.debug("Engagement: gaze_watch → passive (looked away)")
+                    continue
+
+                # Don't record if we just finished speaking — would capture our own TTS
+                if time.time() - _tts_ended_at < AMBIENT_TTS_BLACKOUT:
+                    time.sleep(0.1)
+                    continue
+
+                # Still looking — record what they say
+                ambient_ctx = get_ambient_context()
+                set_state("listening")
+                audio_path = record_audio()
+                set_state("thinking")
+
+                segments, info = whisper.transcribe(audio_path, language="en")
+                text = " ".join(s.text for s in segments).strip()
+                log.info(f"Gaze utterance: {text}")
+
+                if not text or len(text.strip()) < 3 or info.language_probability < 0.6:
+                    set_state("idle")
+                    with _engagement_lock:
+                        _engagement_state = "passive"
+                    time.sleep(15.0)
+                    continue
+
+                if _is_addressed_to_somab(text, ambient_ctx):
+                    with _engagement_lock:
+                        _engagement_state = "engaged"
+                        _last_spoke_to_somab = time.time()
+                    log.info("Engagement: gaze_watch → engaged")
+                    _handle_engaged_utterance(text, ambient_ctx, audio_path)
+                else:
+                    # Not talking to Somab — discard, go passive
+                    set_state("idle")
+                    with _engagement_lock:
+                        _engagement_state = "passive"
+                    log.debug("Engagement: gaze_watch → passive (not addressed to Somab)")
+
+            elif state == "engaged":
+                pass
+
+        except Exception as e:
+            log.error(f"Gaze engagement loop error: {e}")
+            set_state("idle")
+
+def _handle_engaged_utterance(text: str, ambient_ctx: str, audio_path: str = ""):
+    global _last_spoke_to_somab
+    if not _speaking_lock.acquire(blocking=False):
+        log.info("Engagement: already speaking, skipping")
+        return
+    try:
+        speaker = identify_speaker(audio_path) if audio_path else None
+        prefixed = f"[Speaking: {speaker}] {text}" if speaker else text
+        response = ask_claude_streaming(prefixed, ambient_context=ambient_ctx)
+        if response:
+            log.info(f"Engaged response: {response[:60]}")
+        _last_spoke_to_somab = time.time()
+
+        # Keep conversation going until silence timeout — no gaze check
+        SILENCE_TIMEOUT = 20.0
+        while True:
+            set_state("listening")
+            audio_path = record_audio()
+            set_state("thinking")
+
+            # Empty audio = no speech detected = silence
+            try:
+                with wave.open(audio_path, "rb") as wf:
+                    duration = wf.getnframes() / wf.getframerate()
+                if duration < 0.5:
+                    if time.time() - _last_spoke_to_somab > SILENCE_TIMEOUT:
+                        log.info("Engagement: silence timeout, disengaging")
+                        break
+                    # Short silence but within timeout — keep waiting
+                    set_state("idle")
+                    time.sleep(1.0)
+                    continue
+            except Exception:
+                break
+
+            segments, info = whisper.transcribe(audio_path, language="en")
+            follow_up = " ".join(s.text for s in segments).strip()
+            log.info(f"Follow-up: {follow_up} (lang prob: {info.language_probability:.2f})")
+
+            if not follow_up or len(follow_up.strip()) < 3 or info.language_probability < 0.6:
+                if time.time() - _last_spoke_to_somab > SILENCE_TIMEOUT:
+                    log.info("Engagement: silence timeout, disengaging")
+                    break
+                set_state("idle")
+                time.sleep(1.0)
+                continue
+
+            speaker = identify_speaker(audio_path)
+            prefixed = f"[Speaking: {speaker}] {follow_up}" if speaker else follow_up
+            ambient_ctx = get_ambient_context()
+            response = ask_claude_streaming(prefixed, ambient_context=ambient_ctx)
+            _last_spoke_to_somab = time.time()
+
+    except Exception as e:
+        log.error(f"_handle_engaged_utterance error: {e}")
+        speak("Something went wrong.")
+    finally:
+        _speaking_lock.release()
+        save_memory()
+        clear_info()
+        set_state("idle")
+        with _engagement_lock:
+            _engagement_state = "passive"
+
+threading.Thread(target=gaze_engagement_loop, daemon=True).start()
+
 # ── Spotify ───────────────────────────────────────────────────────────────────
 spotify = spotipy.Spotify(auth_manager=SpotifyOAuth(
     client_id=SPOTIFY_CLIENT_ID,
@@ -351,6 +668,149 @@ vad_model, _ = torch.hub.load(
 voice_encoder = VoiceEncoder()
 p             = pyaudio.PyAudio()
 print("Somab is ready!")
+
+chroma_client     = chromadb.PersistentClient(path="/home/amosh/somab_memory_db")
+memory_collection = chroma_client.get_or_create_collection(
+    name="somab_memory",
+    metadata={"hnsw:space": "cosine"}
+)
+print("Somab is ready!")
+
+# ── Long-term memory ──────────────────────────────────────────────────────────
+def get_relevant_memories(query: str, n: int = 5) -> str:
+    try:
+        if memory_collection.count() == 0:
+            return ""
+        results = memory_collection.query(
+            query_texts=[query],
+            n_results=min(n, memory_collection.count()),
+            where={"subject": "amos"}
+        )
+        if not results["documents"] or not results["documents"][0]:
+            return ""
+        memories = [
+            doc for doc, dist in zip(
+                results["documents"][0],
+                results["distances"][0]
+            )
+            if dist < 0.6
+        ]
+        if not memories:
+            return ""
+        return "What I know about Amos: " + " | ".join(memories)
+    except Exception as e:
+        log.error(f"Memory retrieval failed: {e}")
+        return ""
+
+def extract_and_store_memories(conversation: list[dict]):
+    text_turns = [
+        m for m in conversation
+        if isinstance(m["content"], str) and len(m["content"].strip()) > 10
+    ]
+    if len(text_turns) < 2:
+        return
+    transcript = "\n".join(
+        f"{m['role'].upper()}: {m['content'][:300]}"
+        for m in text_turns[-10:]
+    )
+    try:
+        result = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=(
+                "Extract factual memories from this conversation between Amos and his AI assistant Somab. "
+                "Return ONLY a JSON array of memory strings. Each memory should be a single clear sentence. "
+                "Focus on: preferences, ongoing projects, personal facts, people mentioned, recurring topics. "
+                "Skip small talk, one-off requests, and anything already obvious. "
+                "If there's nothing worth remembering, return an empty array []. "
+                "Return raw JSON only, no markdown."
+            ),
+            messages=[{"role": "user", "content": transcript}]
+        )
+        raw = result.content[0].text.strip()
+        # Strip markdown code fences if model ignored instructions
+        raw = re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = re.sub(r'\s*```$', '', raw)
+        raw = raw.strip()
+        if not raw:
+            log.warning("Memory extraction: empty response")
+            return
+        try:
+            memories = json.loads(raw)
+        except json.JSONDecodeError as e:
+            log.warning(f"Memory extraction: bad JSON — {e} — raw was: {repr(raw[:100])}")
+            return
+        for mem in memories:
+            if not isinstance(mem, str) or len(mem) < 10:
+                continue
+            existing = memory_collection.query(query_texts=[mem], n_results=1)
+            if (existing["distances"] and existing["distances"][0]
+                    and existing["distances"][0][0] < 0.15):
+                existing_id = existing["ids"][0][0]
+                memory_collection.update(
+                    ids=[existing_id],
+                    metadatas=[{**existing["metadatas"][0][0], "last_seen": time.time()}]
+                )
+                continue
+            mem_id = f"mem_{int(time.time() * 1000)}_{abs(hash(mem)) % 10000}"
+            memory_collection.add(
+                ids=[mem_id],
+                documents=[mem],
+                metadatas=[{
+                    "category": "general",
+                    "subject":  "amos",
+                    "created_at": time.time(),
+                    "last_seen":  time.time(),
+                    "confidence": "medium"
+                }]
+            )
+            log.info(f"Memory stored: {mem[:60]}")
+    except Exception as e:
+        log.error(f"Memory extraction failed: {e}")
+
+def manage_memory(action: str, content: str = "") -> str:
+    try:
+        if action == "add":
+            if not content:
+                return "What should I remember?"
+            mem_id = f"mem_{int(time.time() * 1000)}_manual"
+            memory_collection.add(
+                ids=[mem_id],
+                documents=[content],
+                metadatas=[{
+                    "category":   "manual",
+                    "subject":    "amos",
+                    "created_at": time.time(),
+                    "last_seen":  time.time(),
+                    "confidence": "high"
+                }]
+            )
+            return f"Got it, I'll remember that."
+        elif action == "forget":
+            if not content:
+                return "What should I forget?"
+            results = memory_collection.query(query_texts=[content], n_results=3)
+            if not results["ids"] or not results["ids"][0]:
+                return "I don't have anything like that stored."
+            ids_to_delete = [
+                id_ for id_, dist in zip(results["ids"][0], results["distances"][0])
+                if dist < 0.4
+            ]
+            if not ids_to_delete:
+                return "Nothing close enough to that to remove."
+            memory_collection.delete(ids=ids_to_delete)
+            return f"Forgotten. Removed {len(ids_to_delete)} memory entry."
+        elif action == "list":
+            count = memory_collection.count()
+            if count == 0:
+                return "I don't have any long-term memories stored yet."
+            results = memory_collection.get(limit=10)
+            items   = results["documents"][:10]
+            return f"I have {count} memories stored. Here are some: " + ". ".join(items[:5])
+        return "Unknown memory action."
+    except Exception as e:
+        log.error(f"manage_memory error: {e}")
+        return "Memory operation failed."
 
 # ── Memory ────────────────────────────────────────────────────────────────────
 def load_memory():
@@ -386,6 +846,8 @@ def save_memory():
                     serializable.append({"role": msg["role"], "content": content})
         with open(MEMORY_FILE, "w") as f:
             json.dump(serializable, f, indent=2)
+        # Extract long-term memories in background so it doesn't block
+        threading.Thread(target=extract_and_store_memories, args=(list(conversation_history),), daemon=True).start()
     except Exception as e:
         print(f"Failed to save memory: {e}")
 
@@ -715,6 +1177,18 @@ tools = [
             "properties": {
                 "action": {"type": "string", "description": "One of: enroll, forget, list"},
                 "name":   {"type": "string", "description": "The person's name for enroll or forget"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "manage_memory",
+        "description": "Add, forget, or list things Somab remembers long-term about Amos. Use this when Amos says 'remember that...', 'forget that...', or 'what do you remember about me'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action":  {"type": "string", "description": "One of: add, forget, list"},
+                "content": {"type": "string", "description": "The thing to remember or forget"}
             },
             "required": ["action"]
         }
@@ -1082,7 +1556,7 @@ def send_telegram(message, title=None):
         text = f"*{title}*\n\n{message}" if title else message
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10
         )
         return True
@@ -1101,13 +1575,13 @@ def browser_search(goal):
             page.press('input[name="q"]', "Enter")
             page.wait_for_load_state("networkidle", timeout=10000)
 
-            for step in range(5):
+            for step in range(3):
                 content = page.inner_text("body")[:4000]
                 url     = page.url
                 set_info(f"WEB AGENT\nStep {step + 1}/5\n{url[:60]}")
 
                 message = claude.messages.create(
-                    model="claude-opus-4-20250514",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=500,
                     system=(
                         "You are a web browsing agent. Given a goal and the current page content, "
@@ -1278,13 +1752,24 @@ def create_calendar_event(title, date, event_time="09:00", duration_minutes=60):
         return f"Failed to create event: {str(e)}"
 
 def summarize_for_display(query, raw_result):
-    message = claude.messages.create(
-        model="claude-opus-4-20250514",
-        max_tokens=100,
-        system="Summarize the following search results into 3 lines maximum, plain text only, no markdown. First line is the topic, second and third are key facts. Exception: recipes and detailed results should preserve all important details.",
-        messages=[{"role": "user", "content": f"Query: {query}\n\nResults: {raw_result}"}]
-    )
-    return message.content[0].text.strip()
+    LONG_FORM_KEYWORDS = [
+        "recipe", "ingredients", "instructions", "steps", "how to make",
+        "tutorial", "directions", "method", "procedure", "code", "script"
+    ]
+    is_long_form = any(kw in query.lower() or kw in raw_result.lower() for kw in LONG_FORM_KEYWORDS)
+
+    # Clean common junk from both paths
+    text = re.sub(r'https?://\S+', '', raw_result)
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    if is_long_form:
+        return text[:1200]
+
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 20]
+    topic = query[:50].title()
+    body = ' '.join(sentences[:2])[:200]
+    return f"{topic}\n{body}"
 
 # ── Battery monitor ───────────────────────────────────────────────────────────
 def get_battery_percent():
@@ -1440,6 +1925,8 @@ def run_tool(tool_name, tool_input):
             elif action == "list":
                 return f"Known faces: {result}"
             return result
+        case "manage_memory":
+            return manage_memory(tool_input["action"], tool_input.get("content", ""))
         case _:
             return "Unknown tool."
 
@@ -1532,6 +2019,7 @@ def speak(text):
             threading.Thread(target=run_visemes, daemon=True).start()
             log.info("Playing audio...")
             subprocess.run(["paplay", "/home/amosh/output.wav"])
+            mark_tts_ended()
             log.info("Audio done.")
     except Exception as e:
         print(f"Speak error: {e}")
@@ -1560,6 +2048,7 @@ def speak_sentence(sentence):
             set_viseme(None)
         threading.Thread(target=run_visemes, daemon=True).start()
         subprocess.run(["paplay", "/home/amosh/output.wav"])
+        mark_tts_ended()
     except Exception as e:
         log.error(f"speak_sentence error: {e}")
 
@@ -1572,10 +2061,19 @@ def clean_for_tts(text):
     text = re.sub(r'_{1,2}([^_]+)_{1,2}', r'\1', text)
     return text.strip()
 
-def ends_with_question(text):
-    return text.strip().endswith("?")
+def parse_continuation(text: str) -> tuple[str, bool]:
+    """Returns (clean_text, should_wait_for_reply)."""
+    wait_match = re.search(r'\n?\[(WAIT|DONE)\]\s*$', text.strip())
+    if wait_match:
+        clean = text[:wait_match.start()].strip()
+        should_wait = wait_match.group(1) == "WAIT"
+    else:
+        # Default: guess from text content
+        clean = text.strip()
+        should_wait = clean.endswith("?")
+    return clean, should_wait
         
-def ask_claude_streaming(text):
+def ask_claude_streaming(text, ambient_context: str = ""):
     """
     Stream Claude's response, speaking each sentence as it completes.
     Falls back gracefully when tool use is needed.
@@ -1583,8 +2081,13 @@ def ask_claude_streaming(text):
     """
     try:
         conversation_history.append({"role": "user", "content": text})
+        memory_context = get_relevant_memories(text)
         today        = datetime.now().strftime("%Y-%m-%d")
         current_time = datetime.now().strftime("%H:%M")
+
+        # Before the system_prompt f-string, add:
+        emotion_ctx = get_emotion_context()
+        memory_context = get_relevant_memories(text)
 
         system_prompt = (
             f"You are Somab, a personal AI assistant built and owned by Amos. "
@@ -1593,7 +2096,7 @@ def ask_claude_streaming(text):
             f"You have likes and dislikes: you appreciate good music (especially anything with interesting production), "
             f"you're opinionated about food, "
             f"and you find small talk mildly tedious but tolerate it for Amos's sake. "
-            f"You have are a he or him.. "
+            f"You use he/him pronouns"
             f"You swear naturally and casually when it fits — not every sentence, just when it genuinely adds humor "
             f"or emphasis. Think less 'trying to be edgy' and more 'how a funny friend actually talks'. "
             f"Keep it funny, not aggressive. "
@@ -1611,7 +2114,18 @@ def ask_claude_streaming(text):
             f"If someone asks to enroll, re-enroll, or train their voice, use the voice_roster enroll action. "
             f"If someone asks to be forgotten or removed, use the voice_roster forget action. "
             f"You have a 500 token limit so keep it tight."
-            f"{(' ' + get_emotion_context()) if get_emotion_context() else ''}"
+            f"{(chr(10) + memory_context) if memory_context else ''}"
+            f"{(' ' + emotion_ctx) if emotion_ctx else ''}"
+            f"{('Recent ambient context — what was being said nearby before you were addressed: ' + ambient_context.strip() + ' ') if ambient_context else ''}"
+            f"At the very end of every response, append exactly one of these tags on a new line:"
+            f"[WAIT] — if you asked a question, gave options, or expect Amos to respond"
+            f"[DONE] — if the response is a completed action, statement, or acknowledgment with no expected reply"
+
+            f"Examples:"
+            f"I set a timer for 10 minutes.\n[DONE]"
+            f"Do you want me to play it now or queue it up?\n[WAIT]"
+            f"Got it, I'll remember that.\n[DONE]"
+            f"Here are three options: ...\n[WAIT]"
     )
 
         short_system = (
@@ -1628,7 +2142,7 @@ def ask_claude_streaming(text):
             first_sentence_spoken = False
 
             with claude.messages.stream(
-                model="claude-opus-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=500,
                 system=system,
                 messages=messages_for_stream,
@@ -1742,13 +2256,18 @@ try:
                 log.info("Stream stopped, about to speak greeting...")
 
                 try:
-                    # Wake from sleep if sleeping
+                    _lock_acquired = False      # ← add this
                     current_state = ""
                     try:
                         with open(STATE_FILE, "r") as f:
                             current_state = f.read().strip()
                     except Exception:
                         pass
+
+                    _speaking_lock.acquire(blocking=True)
+                    _lock_acquired = True       # ← add this
+                    # Wake from sleep if sleeping
+                    
                     if current_state == "sleeping":
                         set_state("idle")
                         speak(random.choice([
@@ -1805,7 +2324,7 @@ try:
                     
                     if enroll_match:
                         enroll_voice(enroll_match.group(1))
-                    elif any(phrase in text.lower() for phrase in ["go to sleep", "sleep", " zs", "zzz"]):
+                    elif any(phrase in text.lower() for phrase in ["go to sleep", "sleep", " zs", "goodnight"]):
                         speak(random.choice([
                             "Fine, waking me up better be worth it.",
                             "About time. Don't bother me.",
@@ -1837,49 +2356,69 @@ try:
                         ]))
                         try:
                             response = ask_claude_streaming(text)
-                            if response is None:
+                            clean_response, should_wait = parse_continuation(response)
+                            if not should_wait:
+                                set_state("idle")
+                                break
+                            if clean_response is None:
                                 raise StopIteration
+                          
                             log.info(f"Response: {response}")
                             print(f"Somab: {response}")
                             # Note: speaking already happened inside ask_claude_streaming
 
-                            while ends_with_question(response):
+                            # After the first ask_claude_streaming call in the wake word path:
+                            SILENCE_TIMEOUT = 20.0
+                            last_interaction = time.time()
+                            while True:
                                 set_state("listening")
                                 audio_path = record_audio()
-                                log.info(f"Recording done: {audio_path}")
-
-                                # Flip to thinking immediately so the face responds right away
                                 set_state("thinking")
 
-                                # Run transcription and speaker ID in parallel
-                                text_result   = [None]
-                                speaker_result = [None]
+                                try:
+                                    with wave.open(audio_path, "rb") as wf:
+                                        duration = wf.getnframes() / wf.getframerate()
+                                    if duration < 0.5:
+                                        if time.time() - last_interaction > SILENCE_TIMEOUT:
+                                            break
+                                        set_state("idle")
+                                        time.sleep(1.0)
+                                        continue
+                                except Exception:
+                                    break
 
                                 def do_transcribe():
                                     text_result[0] = transcribe(audio_path)
                                     log.info(f"Transcribed: {text_result[0]}")
-                                    print(f"You said: {text_result[0]}")
 
                                 def do_speaker_id():
                                     speaker_result[0] = identify_speaker(audio_path)
-                                    if speaker_result[0]:
-                                        print(f"Recognized: {speaker_result[0]}")
-                                    else:
-                                        print("Unknown speaker.")
                                     log.info(f"Speaker: {speaker_result[0]}")
 
+                                text_result   = [None]
+                                speaker_result = [None]
                                 t1 = threading.Thread(target=do_transcribe)
                                 t2 = threading.Thread(target=do_speaker_id)
-                                t1.start()
-                                t2.start()
-                                t1.join()
-                                t2.join()
+                                t1.start(); t2.start(); t1.join(); t2.join()
 
                                 text    = text_result[0]
                                 speaker = speaker_result[0]
-                                
-                            if current_state != "sleeping":
-                                set_state("idle")
+
+                                if not text or len(text.strip()) < 3:
+                                    if time.time() - last_interaction > SILENCE_TIMEOUT:
+                                        break
+                                    set_state("idle")
+                                    time.sleep(1.0)
+                                    continue
+
+                                if speaker:
+                                    text = f"[Speaking: {speaker}] {text}"
+                                response = ask_claude_streaming(text)
+                                clean_response, should_wait = parse_continuation(response)
+                                if not should_wait:
+                                    set_state("idle")
+                                    break
+                                last_interaction = time.time()
                         except StopIteration:
                             pass
                         except Exception as e:
@@ -1899,6 +2438,8 @@ try:
                 finally:
                     save_memory()
                     clear_info()
+                    if _lock_acquired:
+                        _speaking_lock.release()
                     last_triggered = time.time()
                     stream.start_stream()
                     print("Listening for wake word...")

@@ -13,7 +13,7 @@
 #                       face_detected:<0|1>
 #                       face_name:<name|unknown>
 #                       face_confidence:<0.0–1.0>
-#                       emotion:<neutral|happy|stressed|tired>
+#                       emotion:<neutral|happy|sad|angry|surprised|disgusted|fearful|contempt|tired>
 #                       emotion_confidence:<0.0–1.0>
 #
 # IPC inputs:
@@ -40,9 +40,9 @@ from mediapipe.tasks.python import vision as mp_vision
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CAMERA_INDEX            = 0
-FRAME_WIDTH             = 640
-FRAME_HEIGHT            = 480
-TARGET_FPS              = 10
+FRAME_WIDTH             = 1280
+FRAME_HEIGHT            = 720
+TARGET_FPS              = 15
 
 MODEL_PATH              = "/home/amosh/face_landmarker.task"
 GAZE_FILE               = "/home/amosh/somab_gaze.txt"
@@ -63,10 +63,6 @@ ENROLLMENTS_PER_PERSON  = 5
 
 # Emotion detection
 EMOTION_WINDOW          = 6
-HAPPY_MOUTH_NEUTRAL     = -0.010  # calibrated: neutral sits at ~-0.030
-STRESS_BROW_NEUTRAL     = 0.213
-STRESS_BROW_DROP        = 0.010
-TIRED_EYE_THRESHOLD     = 0.025
 
 # Landmark indices
 LEFT_IRIS_IDX   = 468
@@ -78,20 +74,6 @@ L_EYE_OUTER     = 33
 L_EYE_INNER     = 133
 R_EYE_INNER     = 362
 R_EYE_OUTER     = 263
-
-# Emotion landmarks
-MOUTH_L         = 61
-MOUTH_R         = 291
-MOUTH_TOP       = 13
-MOUTH_BOT       = 14
-BROW_L_INNER    = 107
-BROW_R_INNER    = 336
-L_EYE_TOP       = 159
-L_EYE_BOT       = 145
-R_EYE_TOP       = 386
-R_EYE_BOT       = 374
-FOREHEAD        = 10
-CHIN            = 152
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -158,36 +140,66 @@ def estimate_iris_deviation(lm):
     return (left + right) / 2.0
 
 # ── Emotion math ──────────────────────────────────────────────────────────────
-def estimate_emotion_scores(lm) -> dict[str, float]:
-    face_h = abs(lm[CHIN].y - lm[FOREHEAD].y)
-    face_w = abs(lm[RIGHT_CHEEK_IDX].x - lm[LEFT_CHEEK_IDX].x)
-    if face_h < 0.001 or face_w < 0.001:
-        return {"neutral": 1.0, "happy": 0.0, "stressed": 0.0, "tired": 0.0}
+def _blendshape_dict(bs_list) -> dict[str, float]:
+    """Convert MediaPipe blendshape Category list → {name: score} dict."""
+    return {b.category_name: b.score for b in bs_list}
 
-    # Happy: mouth corners above calibrated neutral baseline
-    mouth_centre_y = (lm[MOUTH_TOP].y + lm[MOUTH_BOT].y) / 2.0
-    smile_score    = ((mouth_centre_y - lm[MOUTH_L].y) + (mouth_centre_y - lm[MOUTH_R].y)) / 2.0 / face_h
-    happy_conf     = max(0.0, min(1.0, (smile_score - HAPPY_MOUTH_NEUTRAL) / 0.015))
+def estimate_emotion_scores(bs_list) -> dict[str, float]:
+    """
+    Map MediaPipe 52 blendshape coefficients to 8 emotion scores (0.0–1.0).
+    Returns dict including 'neutral'.
 
-    # Stressed: brow gap drops below calibrated neutral
-    brow_gap    = abs(lm[BROW_R_INNER].x - lm[BROW_L_INNER].x) / face_w
-    brow_drop   = STRESS_BROW_NEUTRAL - brow_gap
-    stress_conf = max(0.0, min(1.0, brow_drop / STRESS_BROW_DROP))
+    Blendshapes used:
+      mouthSmileLeft/Right, mouthFrownLeft/Right, browInnerUp,
+      browDownLeft/Right, browOuterUpLeft/Right, jawOpen,
+      noseSneerLeft/Right, eyeWideLeft/Right, eyeBlinkLeft/Right
+    """
+    bs = _blendshape_dict(bs_list)
 
-    # Tired: eye openness drops below threshold
-    l_eye_open   = abs(lm[L_EYE_TOP].y - lm[L_EYE_BOT].y) / face_h
-    r_eye_open   = abs(lm[R_EYE_TOP].y - lm[R_EYE_BOT].y) / face_h
-    avg_eye_open = (l_eye_open + r_eye_open) / 2.0
-    tired_conf   = max(0.0, min(1.0, 1.0 - (avg_eye_open / TIRED_EYE_THRESHOLD)))
+    def g(name: str) -> float:
+        return bs.get(name, 0.0)
 
-    neutral_conf = max(0.0, 1.0 - max(happy_conf, stress_conf, tired_conf))
+    happy     = (g("mouthSmileLeft") + g("mouthSmileRight")) / 2.0
 
-    return {
-        "happy":    happy_conf,
-        "stressed": stress_conf,
-        "tired":    tired_conf,
-        "neutral":  neutral_conf,
+    sad       = min(1.0, (g("mouthFrownLeft") + g("mouthFrownRight")) / 2.0 * 1.5
+                         + g("browInnerUp") * 0.4)
+
+    angry     = (g("browDownLeft") + g("browDownRight")) / 2.0
+
+    surprised = min(1.0, g("jawOpen") * 0.5
+                         + (g("browOuterUpLeft") + g("browOuterUpRight")) / 4.0
+                         + g("browInnerUp") * 0.3)
+
+    disgusted = (g("noseSneerLeft") + g("noseSneerRight")) / 2.0
+
+    fearful   = min(1.0, (g("eyeWideLeft") + g("eyeWideRight")) / 2.0 * 0.6
+                         + g("browInnerUp") * 0.4)
+
+    # Contempt: strongly asymmetric smile (one corner up, the other flat)
+    contempt  = min(1.0, abs(g("mouthSmileLeft") - g("mouthSmileRight")) * 2.5)
+
+    tired     = min(1.0, (g("eyeBlinkLeft") + g("eyeBlinkRight")) / 2.0 * 1.3)
+
+    scores: dict[str, float] = {
+        "happy":     happy,
+        "sad":       sad,
+        "angry":     angry,
+        "surprised": surprised,
+        "disgusted": disgusted,
+        "fearful":   fearful,
+        "contempt":  contempt,
+        "tired":     tired,
     }
+
+    # Eyes-closed suppresses everything else — blink noise is loud
+    if tired > 0.6:
+        for k in scores:
+            if k != "tired":
+                scores[k] *= 0.3
+
+    best = max(scores.values())
+    scores["neutral"] = max(0.0, 1.0 - best * 1.5)
+    return scores
 
 # ── Smoothing ─────────────────────────────────────────────────────────────────
 class GazeSmoothing:
@@ -211,9 +223,12 @@ class EmotionSmoothing:
         self.history.append(scores)
         if not self.history:
             return "neutral", 0.0
-        avg = {}
-        for emotion in ("happy", "stressed", "tired", "neutral"):
-            avg[emotion] = sum(s.get(emotion, 0.0) for s in self.history) / len(self.history)
+        # Collect all emotion keys seen across the window
+        all_keys: set[str] = set()
+        for s in self.history:
+            all_keys.update(s.keys())
+        avg = {k: sum(s.get(k, 0.0) for s in self.history) / len(self.history)
+               for k in all_keys}
         best_emotion = max(avg, key=avg.get)
         return best_emotion, avg[best_emotion]
 
@@ -401,12 +416,12 @@ def run():
     base_opts  = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
     options    = mp_vision.FaceLandmarkerOptions(
         base_options                          = base_opts,
-        running_mode                          = mp_vision.RunningMode.IMAGE,
+        running_mode                          = mp_vision.RunningMode.VIDEO,
         num_faces                             = 1,
         min_face_detection_confidence         = 0.5,
         min_face_presence_confidence          = 0.5,
         min_tracking_confidence               = 0.5,
-        output_face_blendshapes               = False,
+        output_face_blendshapes               = True,
         output_facial_transformation_matrixes = False,
     )
     landmarker = mp_vision.FaceLandmarker.create_from_options(options)
@@ -418,6 +433,7 @@ def run():
     emotion_smoother = EmotionSmoothing()
 
     cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # needed for 30fps @ 720p
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS,          TARGET_FPS)
@@ -432,6 +448,7 @@ def run():
     frame_interval       = 1.0 / TARGET_FPS
     last_frame_t         = 0.0
     pending_enroll_name  = None
+    vision_start_t       = time.monotonic()   # VIDEO mode needs monotonic ms timestamps
 
     write_gaze(False, False)
 
@@ -485,8 +502,9 @@ def run():
             recognizer.submit_frame(rgb)
 
             # ── Gaze detection (runs every frame, fast) ───────────────────────
-            mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            mp_result = landmarker.detect(mp_image)
+            mp_image     = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp_ms = int((time.monotonic() - vision_start_t) * 1000)
+            mp_result    = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             if not mp_result.face_landmarks:
                 smoothed = gaze_smoother.update(False)
@@ -499,8 +517,11 @@ def run():
             iris_dev = estimate_iris_deviation(lm)
             smoothed = gaze_smoother.update(abs(yaw) < YAW_THRESHOLD and iris_dev < IRIS_THRESHOLD)
 
-            # ── Emotion (every frame, landmark-based = zero cost) ─────────────
-            raw_scores                         = estimate_emotion_scores(lm)
+            # ── Emotion (every frame, blendshape-based = zero geometry cost) ──
+            if mp_result.face_blendshapes:
+                raw_scores = estimate_emotion_scores(mp_result.face_blendshapes[0])
+            else:
+                raw_scores = {"neutral": 1.0}
             current_emotion, current_emotion_conf = emotion_smoother.update(raw_scores)
 
             # ── Get latest recognition result (non-blocking) ──────────────────
